@@ -959,6 +959,7 @@ const KEY_HEIGHT = 14;
 const ROLL_HEIGHT = NUM_KEYS * KEY_HEIGHT;
 const TRACK_LANE_HEIGHT = 80;
 const PLAYBACK_LEAD_SEC = 0.3;
+const PLAYBACK_SCHEDULE_WINDOW_BEATS = 32;
 const RECORD_RUNWAY_BEATS = 8;
 const PAN_TAIL_BEATS = 8;
 const FOLLOW_ANCHOR_RATIO = 0.30; // playhead sits at 30% viewport width while following
@@ -985,6 +986,7 @@ let isPlaying = false;
 let playStartCtxTime = 0;
 let playStartBeat = 0;
 let playbackEndBeat = Infinity;
+let playbackScheduledThroughBeat = 0;
 let playbackSingleClipId = null;
 let currentBeat = 0;
 let selectedClips = new Set();   // clip ids in sequencer
@@ -1058,6 +1060,7 @@ let masterGain = null;
 let playbackBus = null;     // gain node — disconnect to instantly silence everything
 let scheduledNodes = [];    // all nodes created for current playback
 let playbackTrackGains = new Map(); // trackId -> gain node for live mute/solo/vol
+let audioResumePromise = null;
 
 function ensureAudio() {
   if (!audioCtx) {
@@ -1066,7 +1069,15 @@ function ensureAudio() {
     masterGain.gain.value = project ? project.master : 0.75;
     masterGain.connect(audioCtx.destination);
   }
-  if (audioCtx.state === 'suspended') audioCtx.resume();
+  if (audioCtx.state === 'suspended' || audioCtx.state === 'interrupted') {
+    if (!audioResumePromise) {
+      audioResumePromise = audioCtx.resume().finally(() => {
+        audioResumePromise = null;
+      });
+    }
+    return audioResumePromise;
+  }
+  return Promise.resolve();
 }
 function getAudioScheduleLead(extraLeadSec = 0) {
   const baseLatency = Math.max(0, Number(audioCtx?.baseLatency) || 0);
@@ -1386,12 +1397,24 @@ const INSTRUMENTS = {
   },
 };
 const INSTRUMENT_KEYS = Object.keys(INSTRUMENTS);
+const noiseBufferCache = new WeakMap();
 
 function makeNoiseBuffer(ctx, dur) {
-  const len = Math.floor(ctx.sampleRate * dur);
+  const safeDur = Math.max(0.01, Math.min(90, Number(dur) || 0.1));
+  // Bucket by milliseconds so repeated short drum hits reuse one buffer.
+  const bucketMs = Math.round(safeDur * 1000);
+  let ctxCache = noiseBufferCache.get(ctx);
+  if (!ctxCache) {
+    ctxCache = new Map();
+    noiseBufferCache.set(ctx, ctxCache);
+  }
+  const cached = ctxCache.get(bucketMs);
+  if (cached) return cached;
+  const len = Math.max(1, Math.floor(ctx.sampleRate * (bucketMs / 1000)));
   const buf = ctx.createBuffer(1, len, ctx.sampleRate);
   const ch = buf.getChannelData(0);
   for (let i = 0; i < len; i++) ch[i] = Math.random() * 2 - 1;
+  ctxCache.set(bucketMs, buf);
   return buf;
 }
 function midiToFreq(m) { return 440 * Math.pow(2, (m - 69) / 12); }
@@ -3658,8 +3681,19 @@ function refreshPlaybackTrackMix() {
   }
 }
 
-function startPlayback(opts = {}) {
-  ensureAudio();
+async function startPlayback(opts = {}) {
+  try {
+    await ensureAudio();
+  } catch (_) {
+    showToast('audio unlock failed - click Play again');
+    stopPlayback();
+    return;
+  }
+  if (audioCtx?.state !== 'running') {
+    showToast('audio is blocked in this tab');
+    stopPlayback();
+    return;
+  }
   // stop anything currently playing
   hardStop();
   const playOpts = { ...opts };
@@ -3689,7 +3723,12 @@ function startPlayback(opts = {}) {
     playStartBeat = currentBeat;
     playbackEndBeat = totalBeats();
   }
-  scheduleNotes(playStartBeat, { ...playOpts, startAtTime });
+  playbackScheduledThroughBeat = playStartBeat;
+  if (playbackSingleClipId !== null) {
+    scheduleNotes(playStartBeat, { ...playOpts, startAtTime });
+  } else {
+    schedulePlaybackWindow(playStartBeat + PLAYBACK_SCHEDULE_WINDOW_BEATS, playOpts);
+  }
   requestAnimationFrame(playbackTick);
 }
 
@@ -3718,6 +3757,7 @@ function stopPlayback() {
 function hardStop() {
   isPlaying = false;
   playbackEndBeat = Infinity;
+  playbackScheduledThroughBeat = 0;
   playbackSingleClipId = null;
   // disconnect entire bus -> instant silence
   if (playbackBus) {
@@ -3733,9 +3773,37 @@ function hardStop() {
   playbackTrackGains.clear();
 }
 
+function scheduleInstrumentNote(inst, dest, midi, when, durSec, velocity) {
+  try {
+    inst.play(audioCtx, dest, midi, when, durSec, velocity, scheduledNodes);
+    return true;
+  } catch (err) {
+    console.warn('note scheduling failed', err);
+    return false;
+  }
+}
+
+function schedulePlaybackWindow(targetBeat, opts = {}) {
+  const fromBeat = playbackScheduledThroughBeat;
+  const endBeat = Number.isFinite(playbackEndBeat) ? playbackEndBeat : totalBeats();
+  const toBeat = Math.max(fromBeat, Math.min(targetBeat, endBeat));
+  if (toBeat <= fromBeat) return;
+  const beatSec = 60 / project.bpm;
+  const startAtTime = playStartCtxTime + Math.max(0, fromBeat - playStartBeat) * beatSec;
+  scheduleNotes(fromBeat, {
+    ...opts,
+    startAtTime,
+    toBeat,
+    includeMidNotes: fromBeat <= playStartBeat,
+  });
+  playbackScheduledThroughBeat = toBeat;
+}
+
 function scheduleNotes(fromBeat, opts = {}) {
   const beatSec = 60 / project.bpm;
   const total = totalBeats();
+  const toBeat = Number.isFinite(opts.toBeat) ? Math.min(opts.toBeat, total) : total;
+  const includeMidNotes = opts.includeMidNotes !== false;
   const hasSolo = project.tracks.some(t => t.solo);
   const startAtTime = opts.startAtTime ?? getAudioScheduleStartTime();
 
@@ -3756,50 +3824,62 @@ function scheduleNotes(fromBeat, opts = {}) {
       const noteAbsEnd = noteAbsStart + n.length;
       if (noteAbsEnd <= fromBeat) continue;
       if (noteAbsStart >= clipEnd) continue;
+      if (noteAbsStart >= toBeat) continue;
       if (noteAbsStart >= total) continue;
 
       let scheduledStart = noteAbsStart;
       let scheduledLen = Math.min(n.length, clipEnd - noteAbsStart, total - noteAbsStart);
       if (scheduledStart < fromBeat) {
+        if (!includeMidNotes) continue;
         // Resume during playback: do not retrigger notes before the playhead.
         scheduledLen = noteAbsEnd - fromBeat;
         scheduledStart = fromBeat;
       }
+      scheduledLen = Math.min(scheduledLen, toBeat - scheduledStart);
       if (scheduledLen <= 0) continue;
       const tWhen = startAtTime + (scheduledStart - fromBeat) * beatSec;
-      inst.play(audioCtx, tg, n.midi, tWhen, scheduledLen * beatSec, n.velocity, scheduledNodes);
+      scheduleInstrumentNote(inst, tg, n.midi, tWhen, scheduledLen * beatSec, n.velocity);
     }
     return;
   }
 
   for (const t of project.tracks) {
-    const tg = audioCtx.createGain();
-    tg.gain.value = trackAudibleGain(t, hasSolo);
-    tg.connect(playbackBus);
-    scheduledNodes.push(tg);
-    playbackTrackGains.set(t.id, tg);
+    let tg = playbackTrackGains.get(t.id);
+    if (!tg) {
+      tg = audioCtx.createGain();
+      tg.gain.value = trackAudibleGain(t, hasSolo);
+      tg.connect(playbackBus);
+      scheduledNodes.push(tg);
+      playbackTrackGains.set(t.id, tg);
+    } else {
+      tg.gain.value = trackAudibleGain(t, hasSolo);
+    }
     for (const clip of t.clips) {
       const inst = INSTRUMENTS[clip.instrument]; if (!inst) continue;
       const clipEnd = clip.start + clip.length;
       if (clipEnd <= fromBeat) continue;
+      if (clip.start >= toBeat) continue;
       if (clip.start >= total) continue;
       for (const n of clip.notes) {
         const noteAbsStart = clip.start + n.start;
         const noteAbsEnd = noteAbsStart + n.length;
         if (noteAbsEnd <= fromBeat) continue;
         if (noteAbsStart >= clipEnd) continue;
+        if (noteAbsStart >= toBeat) continue;
         if (noteAbsStart >= total) continue;
 
         let scheduledStart = noteAbsStart;
         let scheduledLen = Math.min(n.length, clipEnd - noteAbsStart, total - noteAbsStart);
         if (scheduledStart < fromBeat) {
+          if (!includeMidNotes) continue;
           // mid-note: start at fromBeat with reduced length
           scheduledLen = noteAbsEnd - fromBeat;
           scheduledStart = fromBeat;
         }
+        scheduledLen = Math.min(scheduledLen, toBeat - scheduledStart);
         if (scheduledLen <= 0) continue;
         const tWhen = startAtTime + (scheduledStart - fromBeat) * beatSec;
-        inst.play(audioCtx, tg, n.midi, tWhen, scheduledLen * beatSec, n.velocity, scheduledNodes);
+        scheduleInstrumentNote(inst, tg, n.midi, tWhen, scheduledLen * beatSec, n.velocity);
       }
     }
   }
@@ -3810,6 +3890,9 @@ function playbackTick() {
   const elapsed = Math.max(0, audioCtx.currentTime - playStartCtxTime);
   const beatSec = 60 / project.bpm;
   currentBeat = playStartBeat + elapsed / beatSec;
+  if (playbackSingleClipId === null) {
+    schedulePlaybackWindow(currentBeat + PLAYBACK_SCHEDULE_WINDOW_BEATS);
+  }
   ensureRecordingRunway();
   keepPlayheadVisible();
   followRecordingPlayheadInRoll();
@@ -3841,12 +3924,12 @@ function playbackTick() {
       } else {
         playbackEndBeat = totalBeats();
       }
-      scheduleNotes(
-        playStartBeat,
-        loopSingleClipId !== null
-          ? { singleClipId: loopSingleClipId, startAtTime: restartAtTime }
-          : { startAtTime: restartAtTime }
-      );
+      playbackScheduledThroughBeat = playStartBeat;
+      if (loopSingleClipId !== null) {
+        scheduleNotes(playStartBeat, { singleClipId: loopSingleClipId, startAtTime: restartAtTime });
+      } else {
+        schedulePlaybackWindow(playStartBeat + PLAYBACK_SCHEDULE_WINDOW_BEATS);
+      }
     } else {
       currentBeat = endBeat;
       stopPlayback();
@@ -6770,6 +6853,10 @@ function initProject(template = 'demo-synthwave') {
   syncProjectNameUI();
   renderTracks();
   setView('sequencer');
+  // Always start newly initialized templates from bar 1 beat 1.
+  currentBeat = 0;
+  if (currentView === 'sequencer') drawSeq(); else drawRoll();
+  updateTimecode();
   resetHistoryBaseline();
 }
 
