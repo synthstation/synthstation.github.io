@@ -876,6 +876,7 @@
       <span class="kbd">Shift + left click + drag</span><span>select clips/notes</span>
       <span class="kbd">Ctrl + left click + drag</span><span>erase clips/notes</span>
       <span class="kbd">Middle click + drag</span><span>pan around the editor</span>
+      <span class="kbd">Option/Alt + mouse wheel</span><span>zoom horizontal at pointer</span>
       <span class="kbd">Drag right edge</span><span>resize a clip or note</span>
       <span class="kbd">Double click clip</span><span>open clip in piano roll</span>
       <span class="kbd">Right click clip / note</span><span>open duplicate/delete context menu</span>
@@ -2432,6 +2433,17 @@ function normalizeWheelZoomDelta(e) {
   return Math.sign(e.deltaY) * Math.max(1, Math.abs(e.deltaY * modeScale) / 120);
 }
 
+function preventHistorySwipeOnWheel(container, e) {
+  // Prevent browser back/forward swipe when horizontal panning hits editor edges.
+  if (Math.abs(e.deltaX) <= Math.abs(e.deltaY)) return;
+  const maxScrollLeft = Math.max(0, container.scrollWidth - container.clientWidth);
+  const atLeftEdge = container.scrollLeft <= 0;
+  const atRightEdge = container.scrollLeft >= maxScrollLeft - 1;
+  if ((e.deltaX < 0 && atLeftEdge) || (e.deltaX > 0 && atRightEdge)) {
+    e.preventDefault();
+  }
+}
+
 function zoomSequencerAtClientX(clientX, direction, strength = 1) {
   const oldZoom = pxPerBeat_seq;
   const factor = Math.pow(1.12, Math.max(1, strength));
@@ -2448,6 +2460,8 @@ function zoomSequencerAtClientX(clientX, direction, strength = 1) {
 }
 
 seqBody.addEventListener('wheel', e => {
+  preventHistorySwipeOnWheel(seqBody, e);
+  if (!e.altKey) return;
   const amount = normalizeWheelZoomDelta(e);
   if (!amount) return;
   e.preventDefault();
@@ -3005,6 +3019,8 @@ function zoomRollAtClientX(clientX, direction, strength = 1) {
 }
 
 gridCol.addEventListener('wheel', e => {
+  preventHistorySwipeOnWheel(gridCol, e);
+  if (!e.altKey) return;
   const amount = normalizeWheelZoomDelta(e);
   if (!amount) return;
   e.preventDefault();
